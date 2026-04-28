@@ -11,6 +11,14 @@ const {
   getStatusDisplayText
 } = require('./stateMachine')
 const { 
+  canCancelOrder,
+  canCheckIn,
+  canCheckOut,
+  canChangeRoom,
+  canUpdateStatus,
+  getStatusLabel
+} = require('./orderService')
+const { 
   acquireRoomLock, 
   releaseRoomLock, 
   checkRoomAvailability, 
@@ -204,22 +212,17 @@ function updateOrderStatus(orderId, newStatus, changedBy = 'system', remark = nu
   const db = getDatabase()
   
   const order = getOrderById(orderId)
-  if (!order) {
-    return { success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' }
-  }
   
-  if (order.status === newStatus) {
-    return { success: true, message: '状态未改变', skipped: true }
-  }
-  
-  const transitionCheck = canTransitionStatus(order.status, newStatus)
-  
-  if (!transitionCheck.allowed) {
+  const statusCheck = canUpdateStatus(order, newStatus)
+  if (!statusCheck.allowed) {
+    if (statusCheck.skipped) {
+      return { success: true, message: '状态未改变', skipped: true }
+    }
     return { 
       success: false, 
-      error: transitionCheck.reason,
-      errorCode: 'STATUS_TRANSITION_DENIED',
-      fromStatus: order.status,
+      error: statusCheck.reason,
+      errorCode: statusCheck.errorCode,
+      fromStatus: order?.status,
       toStatus: newStatus
     }
   }
@@ -276,7 +279,7 @@ function updateOrderStatus(orderId, newStatus, changedBy = 'system', remark = nu
     
     return { 
       success: true, 
-      message: `订单状态已从 [${order.status}] 更新为 [${newStatus}]`,
+      message: `订单状态已从 [${getStatusLabel(order.status)}] 更新为 [${getStatusLabel(newStatus)}]`,
       fromStatus: order.status,
       toStatus: newStatus
     }
@@ -309,27 +312,14 @@ function checkIn(orderId, checkInData) {
   const db = getDatabase()
   
   const order = getOrderById(orderId)
-  if (!order) {
-    return { success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' }
-  }
-  
-  if (order.status !== ORDER_STATUSES.PAID) {
-    return { 
-      success: false, 
-      error: `订单状态为 [${order.status}]，必须是已支付状态才能办理入住`,
-      errorCode: 'INVALID_STATUS_FOR_CHECKIN'
-    }
-  }
   
   const today = dayjs().format('YYYY-MM-DD')
-  const checkInDate = dayjs(order.check_in_date)
-  const scheduledDate = checkInDate.format('YYYY-MM-DD')
-  
-  if (dayjs(today).isBefore(checkInDate, 'day')) {
-    return { 
-      success: false, 
-      error: `入住日期为 ${scheduledDate}，提前入住请联系前台`,
-      errorCode: 'EARLY_CHECKIN'
+  const checkInCheck = canCheckIn(order, today)
+  if (!checkInCheck.allowed) {
+    return {
+      success: false,
+      error: checkInCheck.reason,
+      errorCode: checkInCheck.errorCode
     }
   }
   
@@ -382,26 +372,14 @@ function checkIn(orderId, checkInData) {
 
 function checkOut(orderId, checkOutData) {
   const order = getOrderById(orderId)
-  if (!order) {
-    return { success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' }
-  }
   
-  if (order.status !== ORDER_STATUSES.CHECKED_IN) {
-    return { 
-      success: false, 
-      error: `订单状态为 [${order.status}]，必须是已入住状态才能办理退房`,
-      errorCode: 'INVALID_STATUS_FOR_CHECKOUT'
-    }
-  }
-  
-  const balance = (order.total_amount || 0) - (order.paid_amount || 0) + (order.refund_amount || 0)
-  
-  if (balance > 0.01) {
+  const checkOutCheck = canCheckOut(order)
+  if (!checkOutCheck.allowed) {
     return {
       success: false,
-      error: `订单还有未结清金额 ¥${balance.toFixed(2)}，请先完成支付`,
-      errorCode: 'OUTSTANDING_BALANCE',
-      balance
+      error: checkOutCheck.reason,
+      errorCode: checkOutCheck.errorCode,
+      balance: checkOutCheck.balance
     }
   }
   
@@ -417,15 +395,13 @@ function changeRoom(orderId, newRoomId, changeReason, operator = 'system') {
   const db = getDatabase()
   
   const order = getOrderById(orderId)
-  if (!order) {
-    return { success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' }
-  }
   
-  if (isTerminalStatus(order.status)) {
-    return { 
-      success: false, 
-      error: `订单状态为 [${order.status}]，为终态不可变更`,
-      errorCode: 'TERMINAL_ORDER'
+  const changeRoomCheck = canChangeRoom(order)
+  if (!changeRoomCheck.allowed) {
+    return {
+      success: false,
+      error: changeRoomCheck.reason,
+      errorCode: changeRoomCheck.errorCode
     }
   }
   
@@ -529,26 +505,14 @@ function changeRoom(orderId, newRoomId, changeReason, operator = 'system') {
 
 function cancelOrder(orderId, cancelReason, operator = 'system') {
   const order = getOrderById(orderId)
-  if (!order) {
-    return { success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' }
-  }
   
-  if (isLockedStatus(order.status)) {
-    return { 
-      success: false, 
-      error: `订单状态为 [${order.status}]，锁定状态不可取消，请先办理退房`,
-      errorCode: 'LOCKED_ORDER_CANCEL'
-    }
-  }
-  
-  if (order.status === ORDER_STATUSES.PAID) {
-    if ((order.paid_amount || 0) > 0) {
-      return {
-        success: false,
-        error: '订单已支付，请先办理退款再取消订单',
-        errorCode: 'PAID_ORDER_CANCEL',
-        paidAmount: order.paid_amount
-      }
+  const cancelCheck = canCancelOrder(order)
+  if (!cancelCheck.allowed) {
+    return {
+      success: false,
+      error: cancelCheck.reason,
+      errorCode: cancelCheck.errorCode,
+      paidAmount: cancelCheck.paidAmount
     }
   }
   
