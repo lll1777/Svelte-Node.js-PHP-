@@ -25,7 +25,7 @@ router.get('/today', (req, res) => {
 router.get('/:id', (req, res) => {
   const order = orderModel.getOrderById(parseInt(req.params.id))
   if (!order) {
-    return res.status(404).json({ success: false, error: '订单不存在' })
+    return res.status(404).json({ success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' })
   }
   res.json({ success: true, data: order })
 })
@@ -33,24 +33,18 @@ router.get('/:id', (req, res) => {
 router.get('/number/:orderNumber', (req, res) => {
   const order = orderModel.getOrderByNumber(req.params.orderNumber)
   if (!order) {
-    return res.status(404).json({ success: false, error: '订单不存在' })
+    return res.status(404).json({ success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' })
   }
   res.json({ success: true, data: order })
 })
 
 router.post('/', (req, res) => {
-  const orderData = req.body
+  const result = orderModel.createOrder(req.body)
   
-  if (!orderData.roomId || !orderData.guestName || !orderData.guestPhone || 
-      !orderData.checkInDate || !orderData.checkOutDate) {
-    return res.status(400).json({ success: false, error: '缺少必填字段' })
-  }
-  
-  const order = orderModel.createOrder(orderData)
-  if (order) {
-    res.status(201).json({ success: true, data: order })
+  if (result.success) {
+    res.status(201).json(result)
   } else {
-    res.status(500).json({ success: false, error: '创建订单失败' })
+    res.status(400).json(result)
   }
 })
 
@@ -59,14 +53,15 @@ router.patch('/:id/status', (req, res) => {
   const { status, changedBy, remark } = req.body
   
   if (!status) {
-    return res.status(400).json({ success: false, error: '状态不能为空' })
+    return res.status(400).json({ success: false, error: '状态不能为空', errorCode: 'MISSING_STATUS' })
   }
   
-  const success = orderModel.updateOrderStatus(orderId, status, changedBy || 'system', remark)
-  if (success) {
-    res.json({ success: true })
+  const result = orderModel.updateOrderStatus(orderId, status, changedBy || 'system', remark)
+  
+  if (result.success) {
+    res.json(result)
   } else {
-    res.status(404).json({ success: false, error: '订单不存在或更新失败' })
+    res.status(400).json(result)
   }
 })
 
@@ -75,9 +70,9 @@ router.post('/:id/checkin', (req, res) => {
   const result = orderModel.checkIn(orderId, req.body)
   
   if (result.success) {
-    res.json({ success: true, message: '入住成功' })
+    res.json(result)
   } else {
-    res.status(400).json({ success: false, error: result.error })
+    res.status(400).json(result)
   }
 })
 
@@ -86,9 +81,9 @@ router.post('/:id/checkout', (req, res) => {
   const result = orderModel.checkOut(orderId, req.body)
   
   if (result.success) {
-    res.json({ success: true, message: '退房成功' })
+    res.json(result)
   } else {
-    res.status(400).json({ success: false, error: result.error })
+    res.status(400).json(result)
   }
 })
 
@@ -97,15 +92,15 @@ router.post('/:id/change-room', (req, res) => {
   const { newRoomId, changeReason, operator } = req.body
   
   if (!newRoomId) {
-    return res.status(400).json({ success: false, error: '请选择新房间' })
+    return res.status(400).json({ success: false, error: '请选择新房间', errorCode: 'MISSING_NEW_ROOM' })
   }
   
   const result = orderModel.changeRoom(orderId, parseInt(newRoomId), changeReason, operator || 'system')
   
   if (result.success) {
-    res.json({ success: true, message: '换房成功', priceAdjustment: result.priceAdjustment })
+    res.json(result)
   } else {
-    res.status(400).json({ success: false, error: result.error })
+    res.status(400).json(result)
   }
 })
 
@@ -116,9 +111,9 @@ router.post('/:id/cancel', (req, res) => {
   const result = orderModel.cancelOrder(orderId, cancelReason, operator || 'system')
   
   if (result.success) {
-    res.json({ success: true, message: '取消成功' })
+    res.json(result)
   } else {
-    res.status(400).json({ success: false, error: result.error })
+    res.status(400).json(result)
   }
 })
 
@@ -130,7 +125,7 @@ router.get('/:id/status-history', (req, res) => {
 router.get('/:id/payment-summary', (req, res) => {
   const summary = paymentModel.getOrderPaymentSummary(parseInt(req.params.id))
   if (!summary) {
-    return res.status(404).json({ success: false, error: '订单不存在' })
+    return res.status(404).json({ success: false, error: '订单不存在', errorCode: 'ORDER_NOT_FOUND' })
   }
   res.json({ success: true, data: summary })
 })

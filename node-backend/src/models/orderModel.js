@@ -1,6 +1,31 @@
-const { runQuery, getOne, getAll, transaction } = require('./database')
+const { runQuery, getOne, getAll, getDatabase } = require('./database')
 const dayjs = require('dayjs')
-const { v4: uuidv4 } = require('uuid')
+const { 
+  ORDER_STATUSES, 
+  ROOM_STATUSES,
+  ORDER_STATUS_TRANSITIONS,
+  canTransitionStatus,
+  isTerminalStatus,
+  isLockedStatus,
+  validateOrderDates,
+  getStatusDisplayText
+} = require('./stateMachine')
+const { 
+  canCancelOrder,
+  canCheckIn,
+  canCheckOut,
+  canChangeRoom,
+  canUpdateStatus,
+  getStatusLabel
+} = require('./orderService')
+const { 
+  acquireRoomLock, 
+  releaseRoomLock, 
+  checkRoomAvailability, 
+  setRoomStatus,
+  syncRoomStatusWithOrder,
+  getRoomActiveOrders
+} = require('./roomLock')
 
 function generateOrderNumber() {
   const date = dayjs().format('YYYYMMDD')
@@ -9,49 +34,121 @@ function generateOrderNumber() {
 }
 
 function createOrder(orderData) {
-  const orderNumber = generateOrderNumber()
+  const db = getDatabase()
   
-  const sql = `
-    INSERT INTO orders (
-      order_number, room_id, guest_name, guest_phone, guest_id_card,
-      check_in_date, check_out_date, guest_count, special_requests,
-      total_amount, status, source, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `
-  
-  const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
-  const params = [
-    orderNumber,
-    orderData.roomId,
-    orderData.guestName,
-    orderData.guestPhone,
-    orderData.guestIdCard || null,
-    orderData.checkInDate,
-    orderData.checkOutDate,
-    orderData.guestCount || 1,
-    orderData.specialRequests || null,
-    orderData.totalAmount || 0,
-    orderData.status || 'pending',
-    orderData.source || 'direct',
-    now,
-    now
-  ]
-  
-  const result = runQuery(sql, params)
-  
-  if (result.success) {
-    const order = getOrderById(result.lastInsertRowid)
-    addOrderStatusHistory(result.lastInsertRowid, null, orderData.status || 'pending', orderData.guestName || 'guest')
-    return order
+  if (!orderData.roomId) {
+    return { success: false, error: '请选择房间', errorCode: 'MISSING_ROOM' }
   }
   
-  return null
+  if (!orderData.guestName || !orderData.guestPhone) {
+    return { success: false, error: '客人姓名和电话不能为空', errorCode: 'MISSING_GUEST_INFO' }
+  }
+  
+  if (!orderData.checkInDate || !orderData.checkOutDate) {
+    return { success: false, error: '入住日期和退房日期不能为空', errorCode: 'MISSING_DATES' }
+  }
+  
+  const dateValidation = validateOrderDates(orderData.checkInDate, orderData.checkOutDate)
+  if (!dateValidation.valid) {
+    return { success: false, error: dateValidation.reason, errorCode: 'INVALID_DATES' }
+  }
+  
+  const roomId = parseInt(orderData.roomId)
+  
+  try {
+    const lockResult = acquireRoomLock(roomId, 'booking', `预订锁定: ${orderData.guestName}`)
+    if (!lockResult.success) {
+      return { success: false, error: lockResult.error, errorCode: 'LOCK_FAILED' }
+    }
+    
+    try {
+      const availability = checkRoomAvailability(
+        roomId, 
+        orderData.checkInDate, 
+        orderData.checkOutDate
+      )
+      
+      if (!availability.available) {
+        releaseRoomLock(roomId)
+        return { 
+          success: false, 
+          error: availability.error, 
+          errorCode: availability.errorCode || 'NOT_AVAILABLE',
+          details: availability
+        }
+      }
+      
+      db.exec('BEGIN IMMEDIATE TRANSACTION')
+      
+      const orderNumber = generateOrderNumber()
+      const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+      const initialStatus = ORDER_STATUSES.PENDING
+      
+      const result = runQuery(`
+        INSERT INTO orders (
+          order_number, room_id, guest_name, guest_phone, guest_id_card,
+          check_in_date, check_out_date, guest_count, special_requests,
+          total_amount, paid_amount, refund_amount, status, source, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+      `, [
+        orderNumber,
+        roomId,
+        orderData.guestName,
+        orderData.guestPhone,
+        orderData.guestIdCard || null,
+        orderData.checkInDate,
+        orderData.checkOutDate,
+        orderData.guestCount || 1,
+        orderData.specialRequests || null,
+        orderData.totalAmount || 0,
+        initialStatus,
+        orderData.source || 'direct',
+        now,
+        now
+      ])
+      
+      if (!result.success) {
+        db.exec('ROLLBACK')
+        releaseRoomLock(roomId)
+        return { success: false, error: '创建订单失败', errorCode: 'INSERT_FAILED' }
+      }
+      
+      const orderId = result.lastInsertRowid
+      
+      const historyResult = runQuery(`
+        INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, remark, changed_at)
+        VALUES (?, NULL, ?, ?, ?, ?)
+      `, [orderId, initialStatus, orderData.guestName || 'guest', '创建订单', now])
+      
+      if (!historyResult.success) {
+        console.warn('记录状态历史失败，但订单已创建')
+      }
+      
+      db.exec('COMMIT')
+      
+      const order = getOrderById(orderId)
+      
+      return { 
+        success: true, 
+        data: order,
+        message: '订单创建成功'
+      }
+      
+    } catch (error) {
+      releaseRoomLock(roomId)
+      throw error
+    }
+    
+  } catch (error) {
+    console.error('创建订单失败:', error)
+    return { success: false, error: `系统错误: ${error.message}`, errorCode: 'SYSTEM_ERROR' }
+  }
 }
 
 function getOrderById(orderId) {
   const sql = `
     SELECT o.*, 
-           r.room_number, r.type as room_type, r.price as room_price
+           r.room_number, r.type as room_type, r.price as room_price, r.status as room_status
     FROM orders o
     LEFT JOIN rooms r ON o.room_id = r.id
     WHERE o.id = ?
@@ -112,25 +209,85 @@ function getOrders(filters = {}) {
 }
 
 function updateOrderStatus(orderId, newStatus, changedBy = 'system', remark = null) {
+  const db = getDatabase()
+  
   const order = getOrderById(orderId)
-  if (!order) return false
   
-  const oldStatus = order.status
-  
-  const sql = `
-    UPDATE orders 
-    SET status = ?, updated_at = ?
-    WHERE id = ?
-  `
-  const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
-  const result = runQuery(sql, [newStatus, now, orderId])
-  
-  if (result.success) {
-    addOrderStatusHistory(orderId, oldStatus, newStatus, changedBy, remark)
-    return true
+  const statusCheck = canUpdateStatus(order, newStatus)
+  if (!statusCheck.allowed) {
+    if (statusCheck.skipped) {
+      return { success: true, message: '状态未改变', skipped: true }
+    }
+    return { 
+      success: false, 
+      error: statusCheck.reason,
+      errorCode: statusCheck.errorCode,
+      fromStatus: order?.status,
+      toStatus: newStatus
+    }
   }
   
-  return false
+  try {
+    db.exec('BEGIN IMMEDIATE TRANSACTION')
+    
+    const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+    
+    const updateResult = runQuery(`
+      UPDATE orders 
+      SET status = ?, updated_at = ?
+      WHERE id = ?
+    `, [newStatus, now, orderId])
+    
+    if (!updateResult.success) {
+      db.exec('ROLLBACK')
+      return { success: false, error: '更新订单状态失败', errorCode: 'UPDATE_FAILED' }
+    }
+    
+    const historyResult = runQuery(`
+      INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, remark, changed_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [orderId, order.status, newStatus, changedBy, remark, now])
+    
+    if (!historyResult.success) {
+      console.warn('记录状态历史失败')
+    }
+    
+    if (newStatus === ORDER_STATUSES.CHECKED_OUT) {
+      const roomResult = setRoomStatus(order.room_id, ROOM_STATUSES.CLEANING, '退房后等待清洁')
+      if (!roomResult.success) {
+        console.warn('更新房间状态失败:', roomResult.error)
+      }
+      
+      runQuery(`
+        INSERT INTO cleaning_schedule (room_id, order_id, schedule_date, priority, status, created_at)
+        VALUES (?, ?, ?, 'urgent', 'pending', ?)
+      `, [order.room_id, orderId, dayjs().format('YYYY-MM-DD'), now])
+    }
+    
+    if (newStatus === ORDER_STATUSES.CANCELLED || newStatus === ORDER_STATUSES.REFUNDED) {
+      const activeOrders = getRoomActiveOrders(order.room_id)
+      const otherActiveOrders = activeOrders.filter(o => o.id !== orderId)
+      
+      if (otherActiveOrders.length === 0) {
+        setRoomStatus(order.room_id, ROOM_STATUSES.AVAILABLE, '订单取消/退款后释放')
+      }
+    }
+    
+    db.exec('COMMIT')
+    
+    releaseRoomLock(order.room_id)
+    
+    return { 
+      success: true, 
+      message: `订单状态已从 [${getStatusLabel(order.status)}] 更新为 [${getStatusLabel(newStatus)}]`,
+      fromStatus: order.status,
+      toStatus: newStatus
+    }
+    
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch (e) {}
+    return { success: false, error: `更新状态失败: ${error.message}`, errorCode: 'TRANSACTION_ERROR' }
+  }
 }
 
 function addOrderStatusHistory(orderId, oldStatus, newStatus, changedBy = 'system', remark = null) {
@@ -152,147 +309,219 @@ function getOrderStatusHistory(orderId) {
 }
 
 function checkIn(orderId, checkInData) {
-  const order = getOrderById(orderId)
-  if (!order) return { success: false, error: '订单不存在' }
+  const db = getDatabase()
   
-  if (order.status !== 'paid') {
-    return { success: false, error: '订单未支付，无法入住' }
+  const order = getOrderById(orderId)
+  
+  const today = dayjs().format('YYYY-MM-DD')
+  const checkInCheck = canCheckIn(order, today)
+  if (!checkInCheck.allowed) {
+    return {
+      success: false,
+      error: checkInCheck.reason,
+      errorCode: checkInCheck.errorCode
+    }
   }
   
-  const result = transaction(() => {
+  try {
+    db.exec('BEGIN IMMEDIATE TRANSACTION')
+    
     const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
     
-    const updateOrderSql = `
+    const updateOrderResult = runQuery(`
       UPDATE orders 
-      SET status = 'checked_in', actual_check_in_time = ?, updated_at = ?
+      SET status = ?, actual_check_in_time = ?, updated_at = ?
       WHERE id = ?
-    `
-    runQuery(updateOrderSql, [now, now, orderId])
+    `, [ORDER_STATUSES.CHECKED_IN, now, now, orderId])
     
-    addOrderStatusHistory(orderId, 'paid', 'checked_in', checkInData.operator || 'system', '办理入住')
+    if (!updateOrderResult.success) {
+      db.exec('ROLLBACK')
+      return { success: false, error: '更新订单状态失败', errorCode: 'UPDATE_FAILED' }
+    }
     
-    const updateRoomSql = `
-      UPDATE rooms 
-      SET status = 'occupied', updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateRoomSql, [now, order.room_id])
-  })
-  
-  return result.success ? { success: true } : { success: false, error: result.error }
+    addOrderStatusHistory(
+      orderId, 
+      ORDER_STATUSES.PAID, 
+      ORDER_STATUSES.CHECKED_IN, 
+      checkInData?.operator || 'system', 
+      '办理入住'
+    )
+    
+    const roomResult = setRoomStatus(order.room_id, ROOM_STATUSES.OCCUPIED, '办理入住')
+    if (!roomResult.success) {
+      console.warn('更新房间状态失败:', roomResult.error)
+    }
+    
+    db.exec('COMMIT')
+    
+    releaseRoomLock(order.room_id)
+    
+    return { 
+      success: true, 
+      message: '入住成功',
+      orderNumber: order.order_number,
+      roomNumber: order.room_number,
+      checkInTime: now
+    }
+    
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch (e) {}
+    return { success: false, error: `入住失败: ${error.message}`, errorCode: 'CHECKIN_ERROR' }
+  }
 }
 
 function checkOut(orderId, checkOutData) {
   const order = getOrderById(orderId)
-  if (!order) return { success: false, error: '订单不存在' }
   
-  if (order.status !== 'checked_in') {
-    return { success: false, error: '订单未入住，无法退房' }
+  const checkOutCheck = canCheckOut(order)
+  if (!checkOutCheck.allowed) {
+    return {
+      success: false,
+      error: checkOutCheck.reason,
+      errorCode: checkOutCheck.errorCode,
+      balance: checkOutCheck.balance
+    }
   }
   
-  const result = transaction(() => {
-    const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
-    
-    const updateOrderSql = `
-      UPDATE orders 
-      SET status = 'checked_out', actual_check_out_time = ?, updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateOrderSql, [now, now, orderId])
-    
-    addOrderStatusHistory(orderId, 'checked_in', 'checked_out', checkOutData.operator || 'system', '办理退房')
-    
-    const updateRoomSql = `
-      UPDATE rooms 
-      SET status = 'cleaning', updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateRoomSql, [now, order.room_id])
-    
-    const cleaningSql = `
-      INSERT INTO cleaning_schedule (room_id, order_id, schedule_date, priority, status, created_at)
-      VALUES (?, ?, ?, 'urgent', 'pending', ?)
-    `
-    runQuery(cleaningSql, [order.room_id, orderId, dayjs().format('YYYY-MM-DD'), now])
-  })
-  
-  return result.success ? { success: true } : { success: false, error: result.error }
+  return updateOrderStatus(
+    orderId, 
+    ORDER_STATUSES.CHECKED_OUT, 
+    checkOutData?.operator || 'system',
+    '办理退房'
+  )
 }
 
 function changeRoom(orderId, newRoomId, changeReason, operator = 'system') {
+  const db = getDatabase()
+  
   const order = getOrderById(orderId)
-  if (!order) return { success: false, error: '订单不存在' }
   
-  const newRoomSql = 'SELECT * FROM rooms WHERE id = ?'
-  const newRoom = getOne(newRoomSql, [newRoomId])
-  if (!newRoom) return { success: false, error: '新房间不存在' }
-  
-  if (newRoom.status !== 'available') {
-    return { success: false, error: '新房间不可用' }
+  const changeRoomCheck = canChangeRoom(order)
+  if (!changeRoomCheck.allowed) {
+    return {
+      success: false,
+      error: changeRoomCheck.reason,
+      errorCode: changeRoomCheck.errorCode
+    }
   }
   
-  const oldRoomId = order.room_id
-  const priceAdjustment = (newRoom.price || 0) - (order.room_price || 0)
+  if (parseInt(order.room_id) === parseInt(newRoomId)) {
+    return { success: true, message: '新房间与原房间相同', skipped: true }
+  }
   
-  const result = transaction(() => {
-    const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
-    
-    const updateOrderSql = `
-      UPDATE orders 
-      SET room_id = ?, 
-          total_amount = total_amount + ?,
-          updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateOrderSql, [newRoomId, priceAdjustment, now, orderId])
-    
-    const changeRecordSql = `
-      INSERT INTO room_changes (order_id, old_room_id, new_room_id, change_reason, price_adjustment, changed_by, changed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `
-    runQuery(changeRecordSql, [orderId, oldRoomId, newRoomId, changeReason, priceAdjustment, operator, now])
-    
-    const updateOldRoomSql = `
-      UPDATE rooms 
-      SET status = 'cleaning', updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateOldRoomSql, [now, oldRoomId])
-    
-    const updateNewRoomSql = `
-      UPDATE rooms 
-      SET status = ?, updated_at = ?
-      WHERE id = ?
-    `
-    const newStatus = order.status === 'checked_in' ? 'occupied' : 'available'
-    runQuery(updateNewRoomSql, [newStatus, now, newRoomId])
-  })
+  const newRoom = getOne('SELECT * FROM rooms WHERE id = ?', [newRoomId])
+  if (!newRoom) {
+    return { success: false, error: '新房间不存在', errorCode: 'NEW_ROOM_NOT_FOUND' }
+  }
   
-  return result.success ? { success: true, priceAdjustment } : { success: false, error: result.error }
+  if (newRoom.status === ROOM_STATUSES.MAINTENANCE) {
+    return { success: false, error: '新房间正在维护中', errorCode: 'ROOM_MAINTENANCE' }
+  }
+  
+  const availability = checkRoomAvailability(
+    newRoomId,
+    order.check_in_date,
+    order.check_out_date,
+    orderId
+  )
+  
+  if (!availability.available) {
+    return { 
+      success: false, 
+      error: availability.error, 
+      errorCode: 'ROOM_NOT_AVAILABLE',
+      details: availability
+    }
+  }
+  
+  try {
+    const newLock = acquireRoomLock(newRoomId, 'booking', `换房锁定: ${order.guest_name}`)
+    if (!newLock.success) {
+      return { success: false, error: newLock.error, errorCode: 'LOCK_FAILED' }
+    }
+    
+    try {
+      db.exec('BEGIN IMMEDIATE TRANSACTION')
+      
+      const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+      const oldRoomId = order.room_id
+      const priceAdjustment = (newRoom.price || 0) - (order.room_price || 0)
+      
+      const updateOrderResult = runQuery(`
+        UPDATE orders 
+        SET room_id = ?, 
+            total_amount = total_amount + ?,
+            updated_at = ?
+        WHERE id = ?
+      `, [newRoomId, priceAdjustment, now, orderId])
+      
+      if (!updateOrderResult.success) {
+        db.exec('ROLLBACK')
+        return { success: false, error: '更新订单房间失败', errorCode: 'UPDATE_FAILED' }
+      }
+      
+      runQuery(`
+        INSERT INTO room_changes (order_id, old_room_id, new_room_id, change_reason, price_adjustment, changed_by, changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [orderId, oldRoomId, newRoomId, changeReason, priceAdjustment, operator, now])
+      
+      runQuery(`
+        UPDATE rooms 
+        SET status = 'cleaning', updated_at = ?
+        WHERE id = ?
+      `, [now, oldRoomId])
+      
+      const newStatus = order.status === ORDER_STATUSES.CHECKED_IN ? ROOM_STATUSES.OCCUPIED : ROOM_STATUSES.AVAILABLE
+      runQuery(`
+        UPDATE rooms 
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+      `, [newStatus, now, newRoomId])
+      
+      db.exec('COMMIT')
+      
+      releaseRoomLock(oldRoomId)
+      
+      return { 
+        success: true, 
+        message: '换房成功',
+        oldRoomId,
+        newRoomId,
+        priceAdjustment,
+        oldRoomNumber: order.room_number,
+        newRoomNumber: newRoom.room_number
+      }
+      
+    } catch (error) {
+      releaseRoomLock(newRoomId)
+      throw error
+    }
+    
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch (e) {}
+    return { success: false, error: `换房失败: ${error.message}`, errorCode: 'CHANGE_ROOM_ERROR' }
+  }
 }
 
 function cancelOrder(orderId, cancelReason, operator = 'system') {
   const order = getOrderById(orderId)
-  if (!order) return { success: false, error: '订单不存在' }
   
-  if (!['pending', 'paid'].includes(order.status)) {
-    return { success: false, error: '该订单状态无法取消' }
+  const cancelCheck = canCancelOrder(order)
+  if (!cancelCheck.allowed) {
+    return {
+      success: false,
+      error: cancelCheck.reason,
+      errorCode: cancelCheck.errorCode,
+      paidAmount: cancelCheck.paidAmount
+    }
   }
   
-  const result = transaction(() => {
-    const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
-    
-    updateOrderStatus(orderId, 'cancelled', operator, cancelReason)
-    
-    const updateRoomSql = `
-      UPDATE rooms 
-      SET status = 'available', updated_at = ?
-      WHERE id = ?
-    `
-    runQuery(updateRoomSql, [now, order.room_id])
-  })
-  
-  return result.success ? { success: true } : { success: false, error: result.error }
+  return updateOrderStatus(
+    orderId,
+    ORDER_STATUSES.CANCELLED,
+    operator,
+    cancelReason || '用户取消'
+  )
 }
 
 function getTodayOrders() {

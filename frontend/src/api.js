@@ -21,7 +21,9 @@ export const orderApi = {
   updateStatus: (id, status) => nodeApi.patch(`/orders/${id}/status`, { status }),
   checkIn: (id, data) => nodeApi.post(`/orders/${id}/checkin`, data),
   checkOut: (id, data) => nodeApi.post(`/orders/${id}/checkout`, data),
-  changeRoom: (id, data) => nodeApi.post(`/orders/${id}/change-room`, data)
+  changeRoom: (id, data) => nodeApi.post(`/orders/${id}/change-room`, data),
+  cancel: (id, data) => nodeApi.post(`/orders/${id}/cancel`, data),
+  getStatusHistory: (id) => nodeApi.get(`/orders/${id}/status-history`)
 }
 
 export const paymentApi = {
